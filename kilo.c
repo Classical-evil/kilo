@@ -1,3 +1,4 @@
+#include <stddef.h>
 #define _DEFAULT_SOURCE
 #define _BSD_SOURCE
 #define _GNU_SOURCE
@@ -39,8 +40,9 @@ struct editorConfig {
     int mouse_y;
     int screen_rows;
     int screen_cols;
-    erow rows;
+    erow* rows;
     int numrows;
+    int rows_off;
     struct termios ori_termios;
 };
 
@@ -166,10 +168,22 @@ int editorReadKey()
     return c;
 }
 
+void editorScroll()
+{
+    if (E.mouse_y < E.rows_off) {
+        E.rows_off = E.mouse_y;
+    }
+
+    if (E.mouse_y >= E.rows_off + E.screen_rows) {
+        E.rows_off = E.mouse_y - E.screen_rows + 1;
+    }
+}
+
 void editorDrawRows(struct abuf* ab)
 {
     for (int i = 0; i < E.screen_rows; ++i) {
-        if (i >= E.numrows) {
+        int file_row = i + E.rows_off;
+        if (file_row >= E.numrows) {
             if (E.numrows == 0 && i == E.screen_rows / 3) {
                 char welcome[80];
                 int welcome_len = snprintf(welcome, sizeof(welcome), "Kile editor -- version %s", KILO_VERSION);
@@ -186,9 +200,9 @@ void editorDrawRows(struct abuf* ab)
                 abAppend(ab, "~", 1);
             }
         } else {
-            int len = E.rows.size;
+            int len = E.rows[file_row].size;
             if (len > E.screen_cols) len = E.screen_cols;
-            abAppend(ab, E.rows.chars, len);
+            abAppend(ab, E.rows[file_row].chars, len);
         }
                 
         abAppend(ab, "\x1b[K", 3);
@@ -205,7 +219,7 @@ void editorMoveCursor(int c)
             if (E.mouse_x != 0)E.mouse_x--;
             break;
         case ARROW_DOWN:
-            if (E.mouse_y != E.screen_rows - 1)E.mouse_y++;
+            if (E.mouse_y < E.numrows)E.mouse_y++;
             break;
         case ARROW_RIGHT:
             if (E.mouse_x != E.screen_cols - 1)E.mouse_x++;
@@ -218,6 +232,8 @@ void editorMoveCursor(int c)
 
 void editorRefreshScreen()
 {
+    editorScroll();
+
     struct abuf ab = ABUF_INIT;
 
     abAppend(&ab, "\x1b[?25l", 6);
@@ -226,8 +242,8 @@ void editorRefreshScreen()
     editorDrawRows(&ab);
 
     char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.mouse_y + 1, E.mouse_x + 1);
-    abAppend(&ab, buf, strlen(buf)); 
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.mouse_y - E.rows_off + 1, E.mouse_x + 1);
+    abAppend(&ab, buf, strlen(buf));
 
     abAppend(&ab, "\x1b[?25h", 6);
 
@@ -277,9 +293,23 @@ void initEditor()
     E.mouse_x = 0;
     E.mouse_y = 0;
     E.numrows = 0;
+    E.rows_off = 0;
+    E.rows = NULL;
 
     if (getWindowSize(&E.screen_rows, &E.screen_cols) == -1)
         die("getWindowsizes");
+}
+
+void editorAppendRow(char* s, size_t len)
+{
+    E.rows = realloc(E.rows, sizeof(erow) * (E.numrows + 1));
+
+    int at = E.numrows;
+    E.rows[at].size = len;
+    E.rows[at].chars = malloc(len + 1);
+    memcpy(E.rows[at].chars, s, len);
+    E.rows[at].chars[len] = '\0';
+    E.numrows++;
 }
 
 void editorOpen(char* filename)
@@ -290,15 +320,10 @@ void editorOpen(char* filename)
     char* line = NULL;
     size_t line_cap = 0;
     int line_len = 0;
-    line_len = getline(&line, &line_cap, fp);
-    if (line_len != -1) {
+    while ((line_len = getline(&line, &line_cap, fp)) != -1) {
         while (line_len > 0 && (line[line_len - 1] == '\r' || line[line_len - 1] == '\n'))
             line_len--;
-        E.rows.size = line_len;
-        E.rows.chars = malloc(line_len + 1);
-        memcpy(E.rows.chars, line, line_len);
-        E.rows.chars[line_len] = '\0';
-        E.numrows = 1;
+        editorAppendRow(line, line_len);
     }
     free(line);
     fclose(fp);
