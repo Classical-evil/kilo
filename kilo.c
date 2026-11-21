@@ -15,6 +15,7 @@
 #include <string.h>
 
 #define KILO_VERSION "0.0.1"
+#define KILO_TAB 8
 
 #define CTRL_KEY(k) ((k) & 0x1f)
 
@@ -32,17 +33,22 @@ enum editorKey {
 
 typedef struct erow {
     int size;
+    int rsize;
     char* chars;
+    char* render;
 } erow;
 
 struct editorConfig {
     int mouse_x;
     int mouse_y;
+    int rx;
     int screen_rows;
     int screen_cols;
     erow* rows;
     int numrows;
     int rows_off;
+    int cols_off;
+    char* filename;
     struct termios ori_termios;
 };
 
@@ -168,14 +174,40 @@ int editorReadKey()
     return c;
 }
 
+int editorRowCxToRx(erow* row, int cx)
+{
+    int rx = 0;
+    int j;
+    for (j = 0; j < cx; ++j) {
+        if (row->chars[j] == '\t') {
+            rx += KILO_TAB - 1 + (rx % KILO_TAB);
+        }
+        rx++;
+    }
+    return rx;
+}
+
 void editorScroll()
 {
+    E.rx = 0;
+    if (E.mouse_y < E.numrows) {
+        E.rx = editorRowCxToRx(&E.rows[E.mouse_y], E.mouse_x);
+    }
+
     if (E.mouse_y < E.rows_off) {
         E.rows_off = E.mouse_y;
     }
 
     if (E.mouse_y >= E.rows_off + E.screen_rows) {
         E.rows_off = E.mouse_y - E.screen_rows + 1;
+    }
+
+    if (E.rx < E.cols_off) {
+        E.cols_off = E.rx;
+    }
+
+    if (E.rx >= E.cols_off + E.screen_cols) {
+        E.cols_off = E.rx - E.screen_cols + 1;
     }
 }
 
@@ -200,34 +232,65 @@ void editorDrawRows(struct abuf* ab)
                 abAppend(ab, "~", 1);
             }
         } else {
-            int len = E.rows[file_row].size;
+            int len = E.rows[file_row].rsize - E.cols_off;
+            if (len < 0) len = 0;
             if (len > E.screen_cols) len = E.screen_cols;
-            abAppend(ab, E.rows[file_row].chars, len);
+            abAppend(ab, &E.rows[file_row].render[E.cols_off], len);
         }
                 
         abAppend(ab, "\x1b[K", 3);
-        if (i < E.screen_rows - 1) {
-            abAppend(ab, "\r\n", 2);
-        }
+        abAppend(ab, "\r\n", 2);
     }
 }
 
 void editorMoveCursor(int c)
 {
+    erow* row = (E.mouse_y >= E.numrows) ? NULL : &E.rows[E.mouse_y];
+
     switch (c) {
         case ARROW_LEFT:
             if (E.mouse_x != 0)E.mouse_x--;
+            else if (E.mouse_y > 0) {
+                E.mouse_y--;
+                E.mouse_x = E.rows[E.mouse_y].size;
+            }
             break;
         case ARROW_DOWN:
             if (E.mouse_y < E.numrows)E.mouse_y++;
             break;
         case ARROW_RIGHT:
-            if (E.mouse_x != E.screen_cols - 1)E.mouse_x++;
+            if (row && E.mouse_x < row->size) {
+                E.mouse_x++;
+            } else if (row && E.mouse_x == row->size) {
+                E.mouse_y++;
+                E.mouse_x = 0;
+            }
             break;
         case ARROW_UP:
             if (E.mouse_y != 0)E.mouse_y--;
             break;
     }
+
+    row = (E.mouse_y >= E.numrows) ? NULL : &E.rows[E.mouse_y];
+    int row_len = row ? row->size : 0;
+    if (E.mouse_x > row_len) {
+        E.mouse_x = row_len;
+    }
+}
+
+void editorDrawStatusBar(struct abuf* ab)
+{
+    abAppend(ab, "\x1b[7m", 4);
+    char status[80];
+    int len = snprintf(status, sizeof(status), "%.20s - %d lilnes", (E.filename ? E.filename : "[No name]"), E.numrows);
+    if (len > E.screen_cols) len = E.screen_cols;
+    abAppend(ab, status, len);
+
+    while (len < E.screen_cols) {
+        abAppend(ab, " ", 1);
+        len++;
+    }
+    abAppend(ab, "\x1b[m", 3);
 }
 
 void editorRefreshScreen()
@@ -240,9 +303,10 @@ void editorRefreshScreen()
     abAppend(&ab, "\x1b[H", 3);
     
     editorDrawRows(&ab);
+    editorDrawStatusBar(&ab);
 
     char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.mouse_y - E.rows_off + 1, E.mouse_x + 1);
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.mouse_y - E.rows_off + 1, E.rx - E.cols_off + 1);
     abAppend(&ab, buf, strlen(buf));
 
     abAppend(&ab, "\x1b[?25h", 6);
@@ -266,12 +330,20 @@ void editorProcessKeypress()
             E.mouse_x = 0;
             break;
         case END_KEY:
-            E.mouse_x = E.screen_cols - 1;
+            if (E.mouse_y < E.numrows)
+                E.mouse_x = E.rows[E.mouse_y].size;
             break;
 
         case PAGE_UP:
         case PAGE_DOWN:
             {
+                if (c == PAGE_UP) {
+                    E.mouse_y = E.rows_off;
+                } else if (c == PAGE_DOWN) {
+                    E.mouse_y = E.rows_off + E.screen_rows - 1;
+                    if (E.mouse_y > E.numrows) E.mouse_y = E.numrows;
+                }
+
                 int times = E.screen_rows;
                 while (times--) {
                     editorMoveCursor( c == PAGE_UP ? ARROW_UP : ARROW_DOWN  );
@@ -294,10 +366,40 @@ void initEditor()
     E.mouse_y = 0;
     E.numrows = 0;
     E.rows_off = 0;
+    E.cols_off = 0;
     E.rows = NULL;
+    E.rx = 0;
+    E.filename = NULL;
 
     if (getWindowSize(&E.screen_rows, &E.screen_cols) == -1)
         die("getWindowsizes");
+    E.screen_rows--;
+}
+
+void editorUpdateRow(erow* row)
+{
+    int tabs = 0;
+    for (int i = 0; i < row->size; ++i) {
+        if (row->chars[i] == '\t') {
+            tabs++;
+        }
+    }
+
+    free(row->render);
+    row->render = malloc(row->size+ tabs * (KILO_TAB - 1) + 1);
+
+    int j;
+    int idx = 0;
+    for (j = 0; j < row->size; ++j) {
+        if (row->chars[j] == '\t') {
+            row->render[idx++] = ' ';
+            while (idx % KILO_TAB != 0) row->render[idx++] = ' ';
+        } else {
+            row->render[idx++] = row->chars[j];
+        }
+    }
+    row->render[idx] = '\0';
+    row->rsize = idx;
 }
 
 void editorAppendRow(char* s, size_t len)
@@ -309,11 +411,19 @@ void editorAppendRow(char* s, size_t len)
     E.rows[at].chars = malloc(len + 1);
     memcpy(E.rows[at].chars, s, len);
     E.rows[at].chars[len] = '\0';
+
+    E.rows[at].rsize = 0;
+    E.rows[at].render = NULL;
+    editorUpdateRow(&E.rows[at]);
+
     E.numrows++;
 }
 
 void editorOpen(char* filename)
 {
+    free(E.filename);
+    E.filename = strdup(filename);
+
     FILE* fp = fopen(filename, "r");
     if (!fp) die("fopen");
 
